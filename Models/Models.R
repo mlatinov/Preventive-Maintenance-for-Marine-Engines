@@ -4,6 +4,7 @@ library(tidymodels)
 library(tidyverse)
 library(baguette)
 
+tidymodels_prefer()
 # Load the data 
 marine_data <- read.csv("marine_engine_data.csv",stringsAsFactors = TRUE)
 
@@ -75,7 +76,6 @@ recipe_new_features <- recipe(failure_mode ~ .,data = training_data_a)%>%
     
   # Dummy encode nominal predictors
   step_dummy(all_nominal_predictors())
-  
 
 ##### Define models ####
 
@@ -86,25 +86,11 @@ control_rf <- rand_forest() %>%
   set_engine("ranger")%>%
   set_mode("classification")
   
-# Tuned Random Forest
-tuned_rf <- rand_forest(mtry = tune(),trees = 300,min_n = tune())%>%
-  set_engine("ranger") %>%
-  set_mode("classification")
-  
 ## XGB 
 
 # Control XGB 
 control_xgb <- boost_tree()%>%
   set_engine("xgboost")%>%
-  set_mode("classification")
-  
-# Tuned XGB
-tuned_xgb <- boost_tree(
-  mtry = tune(),
-  min_n = tune(),
-  trees = tune(),learn_rate = tune(),
-  sample_size = tune()) %>%
-  set_engine("xgboost") %>%
   set_mode("classification")
 
 ## SVM
@@ -114,18 +100,14 @@ control_svm <- svm_rbf()%>%
   set_engine("kernlab") %>%
   set_mode("classification")
 
-# Tuned SVM Radial
-tuned_svm <- svm_rbf(
-  cost = tune(),
-  rbf_sigma = tune(),
-  margin = tune()) %>%
-  set_engine("kernlab") %>%
-  set_mode("classification")
+## MLP
 
-# Single Layer Neural Network Model
+# Multiple Layer Neural Network Model
 slnn <- mlp() %>%
   set_engine("nnet")%>%
   set_mode("classification")
+
+## BNN
 
 # Bagged Neural Network Model Specification
 bnn <- bag_mlp()%>%
@@ -175,7 +157,7 @@ final_recipe_standard <- finalize_recipe(recipe_standard, best_standard_params)
 workflow_recipe_tune_newfeatures <-
   workflow_set(
     preproc = list(recipe = recipe_new_features),
-    models = list(random_forest = control_rf,svm = control_svm,xgb = control_xgb))
+    models = list(c_rf = control_rf, c_xgb = control_xgb, c_svm = control_svm,c_slnn = slnn,bnn = bnn,null_model=null_model))
 
 # Tune grid new features recipe
 tune_grid_recipe_new_features <-
@@ -195,7 +177,7 @@ recipe_new_features_tune <-
 # Select Best params
 best_new_features_params <-
   recipe_new_features_tune %>%
-  extract_workflow_set_result("recipe_svm","recipe_random_forest","recipe_xgb")%>%
+  extract_workflow_set_result("recipe_bnn")%>%
   select_best(metric = "accuracy")
 
 # Update 
@@ -204,7 +186,7 @@ finalize_new_feature_recipe <- finalize_recipe(recipe_new_features,best_new_feat
 # Create a workflow set to compare different recipes
 workflow_recipe <- workflow_set(
   preproc = list(simple = final_recipe_standard, control = control_recipe,new_f_recipe = finalize_new_feature_recipe),
-  models = list(c_rf = control_rf, c_xgb = control_xgb, c_svm = control_svm),
+  models = list(c_rf = control_rf, c_xgb = control_xgb, c_svm = control_svm,slnn = slnn,bnn = bnn,null_model = null_model),
   cross = TRUE)
 
 # Evaluate the performance for different recipes
@@ -229,7 +211,7 @@ all_metrics %>%
   facet_wrap(~.metric, scales = "free_y") +
   scale_fill_manual(values = c("accuracy" = "green", "roc_auc" = "blue")) +
   theme_minimal() +
-  coord_cartesian(xlim = c(0.01,0.6),ylim = c(9,1),expand = TRUE)+
+  coord_cartesian(xlim = c(0.01,0.6),ylim = c(18,1),expand = TRUE)+
   labs(
     title = "Compare Different Models with Different Recipes ",
     x = "Mean",
@@ -242,6 +224,161 @@ all_metrics %>%
     strip.text = element_text(size = 10)
   )
 
+#### Model Tuning ####
 
+# Resample
+resample_models <- vfold_cv(data = training_data_a,strata = "failure_mode",v = 5 )
+
+# Metric
+class_and_probs_metrics <- metric_set(roc_auc, pr_auc, accuracy)
+
+## Multiple Layer Neural Network Model
+mlp_tuned <- mlp(
+  hidden_units = tune(),
+  penalty = tune(),
+  epochs = tune())%>%
+  set_engine("brulee") %>%
+  set_mode("classification")
+
+# Workflow 
+mlp_workflow <- 
+  workflow() %>%
+  add_recipe(final_recipe_standard) %>%
+  add_model(mlp_tuned)
+
+# MLP LHC Grid
+mlp_tune_grid <- 
+  grid_space_filling(
+    hidden_units(range = c(1,10)),
+    penalty(range = c(-10,0)),
+    epochs(range = c(10L,100L)))
+
+# Tune
+mlp_tuning <- 
+  mlp_workflow %>%
+  tune_grid(
+    resamples = resample_models,
+    grid = mlp_tune_grid,
+    metrics = class_and_probs_metrics)
+
+# Extract the best performance
+best_mlp <- mlp_tuning %>%
+  select_best(metric = "accuracy")
+
+## Bagged Neural Network Model 
+bnn_tuned <- bag_mlp(
+  hidden_units = tune(),
+  penalty = tune(),
+  epochs = tune())%>%
+  set_engine("nnet") %>%
+  set_mode("classification")
+
+# BNN  LHC Grid
+bnn_tune_grid <- 
+  grid_space_filling(
+    hidden_units(c(1L,10L)),
+    penalty(c(-10,0)),
+    epochs(c(10L,100L)))
+
+# BNN Workflow 
+bnn_workflow <- 
+  workflow() %>%
+  add_model(bnn_tuned) %>%
+  add_recipe(control_recipe)
+
+# Tune BNN
+bnn_tunning <- 
+  bnn_workflow %>%
+  tune_grid(
+    resamples = resample_models,
+    metrics = class_and_probs_metrics,
+    grid = bnn_tune_grid )
+
+# Extract the best result
+bnn_best <- bnn_tunning %>% select_best(metric = "accuracy")
+
+## XGB 
+tuned_xgb <- boost_tree(
+  mtry = tune(),
+  min_n = tune(),
+  trees = tune(),
+  learn_rate = tune(),
+  sample_size = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+# XGB  LHC Grid
+xgb_tune_grid <- 
+  grid_space_filling(
+    mtry(c(1,15)),
+    min_n(c(5,40)),
+    trees(c(1000,2000)),
+    learn_rate(c(-10,-1)),
+    sample_size(c(0,1)))
+
+# XGB Workflow
+xgb_workflow <- 
+  workflow() %>%
+  add_model(tuned_xgb)%>%
+  add_recipe(final_recipe_standard)
+
+# Tune XGB 
+xgb_tuning <- 
+  xgb_workflow %>%
+  tune_grid(
+    resamples = resample_models,
+    grid = xgb_tune_grid,
+    metrics =class_and_probs_metrics)
+
+# Extract best result
+xgb_best <- xgb_tuning %>% select_best(metric = "accuracy")
+
+## Results 
+
+model_tune_f <- function(tuning, model_name, metric_1) {
+  
+  # Extract the metrics data
+  collect <- tuning %>%
+    collect_metrics() %>%
+    mutate(model = model_name)  
+  
+  # Extract the best result 
+  best <- tuning %>% select_best(metric = {{metric_1}})
+  config <- best$.config
+  
+  # Extract the final result 
+  results <- collect %>%
+    filter(.config == config)
+   
+  return(results)
+}
+# Collect the results
+mlp_results <- model_tune_f(tuning = mlp_tuning,model_name = "MLP",metric = "accuracy")
+bnn_results <- model_tune_f(tuning = bnn_tunning,model_name = "BNN",metric = "accuracy")
+xgb_results <- model_tune_f(tuning = xgb_tuning,model_name = "XGB",metric = "accuracy")
+
+# Combine the results
+results <- bind_rows(mlp_results,bnn_results,xgb_results)
+
+# Plot the results
+ggplot(data = results,aes(x = fct_reorder(as.factor(model),.fun = sum,.x = mean ),y = mean,fill = model))+
+  geom_col()+
+  facet_wrap(~.metric)+
+  theme_minimal()+
+  scale_fill_manual(values = c("XGB" = "red","BNN" = "yellow","MLP" = "black"))+
+  labs(
+    title = "Tuned Models Comparison",
+    x = "Models",
+    y = "Mean",
+    fill = "Models"
+  )+
+  theme(
+    title = element_text(size = 12,face = "bold"),
+    strip.text = element_text(size = 10,face = "italic")
+  )
+
+#### Evaluate Models ####
+
+## Evaluation Function ##
 
 
