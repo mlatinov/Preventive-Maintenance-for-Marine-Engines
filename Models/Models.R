@@ -3,6 +3,8 @@
 library(tidymodels)
 library(tidyverse)
 library(baguette)
+library(themis)
+library(pROC)
 
 tidymodels_prefer()
 # Load the data 
@@ -19,8 +21,11 @@ testing_data_a <- testing(split_a)
 
 # Make a control recipe
 control_recipe <-recipe(failure_mode ~ .,data = training_data_a)%>%
+
   # Dummy encode nominal predictors to prevent errors
-  step_dummy(all_nominal_predictors())
+  step_dummy(all_nominal_predictors()) %>%
+  # SMOTE
+  step_smote(failure_mode,over_ratio = 1)
   
 ## Recipe one Standard Features
 recipe_standard <- recipe(failure_mode ~ .,data = training_data_a) %>%
@@ -42,7 +47,7 @@ recipe_standard <- recipe(failure_mode ~ .,data = training_data_a) %>%
            predictor_prop = tune()) %>%
 
   # Dummy encode nominal predictors
-  step_dummy(all_nominal_predictors())
+  step_dummy(all_nominal_predictors()) %>%
 
 ## Recipe two New Features
 recipe_new_features <- recipe(failure_mode ~ .,data = training_data_a)%>%
@@ -56,7 +61,7 @@ recipe_new_features <- recipe(failure_mode ~ .,data = training_data_a)%>%
   
   #Remove original features that were used to create the new ones
   step_rm(exhaust_temp, coolant_temp, fuel_consumption, rpm, vibration_level, engine_load) %>%
-  
+   
    # Remove nzv Features
   step_nzv(all_nominal_predictors()) %>%
      
@@ -75,7 +80,10 @@ recipe_new_features <- recipe(failure_mode ~ .,data = training_data_a)%>%
     predictor_prop = tune()) %>%
     
   # Dummy encode nominal predictors
-  step_dummy(all_nominal_predictors())
+  step_dummy(all_nominal_predictors()) %>%
+  
+  # SMOTE
+  step_smote(failure_mode,over_ratio = 1)
 
 ##### Define models ####
 
@@ -262,8 +270,10 @@ mlp_tuning <-
     metrics = class_and_probs_metrics)
 
 # Extract the best performance
-best_mlp <- mlp_tuning %>%
-  select_best(metric = "accuracy")
+best_mlp <- mlp_tuning %>% select_best(metric = "roc_auc")
+
+# Finalize the workflow
+mlp_tuned <- finalize_workflow(mlp_workflow,parameters = best_mlp)
 
 ## Bagged Neural Network Model 
 bnn_tuned <- bag_mlp(
@@ -295,7 +305,11 @@ bnn_tunning <-
     grid = bnn_tune_grid )
 
 # Extract the best result
-bnn_best <- bnn_tunning %>% select_best(metric = "accuracy")
+bnn_best <- bnn_tunning %>% select_best(metric = "roc_auc")
+
+# Finalize the workflow
+bnn_tuned <- finalize_workflow(bnn_workflow,parameters = bnn_best)
+
 
 ## XGB 
 tuned_xgb <- boost_tree(
@@ -331,8 +345,11 @@ xgb_tuning <-
     metrics =class_and_probs_metrics)
 
 # Extract best result
-xgb_best <- xgb_tuning %>% select_best(metric = "accuracy")
+xgb_best <- xgb_tuning %>% select_best(metric = "roc_auc")
 
+# Finalize the workflow
+xgb_tuned <- finalize_workflow(x = xgb_workflow,parameters = xgb_best)
+  
 ## Results 
 
 model_tune_f <- function(tuning, model_name, metric_1) {
@@ -380,5 +397,84 @@ ggplot(data = results,aes(x = fct_reorder(as.factor(model),.fun = sum,.x = mean 
 #### Evaluate Models ####
 
 ## Evaluation Function ##
+model_eval <- function(training_data, testing_data, tuned_model_workflow){
+  
+  # Fit the final model
+  model_fit <- fit(tuned_model_workflow, training_data)
+  
+  # Make predictions
+  model_prediction <- predict(model_fit, testing_data, type = "prob") %>%
+    bind_cols(predict(model_fit, testing_data, type = "class")) %>%
+    bind_cols(testing_data)
+  
+  # Ensure `failure_mode` is a factor
+  model_prediction$failure_mode <- as.factor(model_prediction$failure_mode)
+  
+  # Get the exact class levels
+  class_levels <- levels(model_prediction$failure_mode)
+  
+  # Select only the probability columns that match the class levels
+  prob_cols <- paste0(".pred_", class_levels)
+  
+  # Ensure that `prob_cols` exists in `model_prediction`
+  prob_cols <- intersect(prob_cols, colnames(model_prediction))
+  
+  # Compute Multi-Class ROC AUC
+  auc <- roc_auc(data = model_prediction, truth = failure_mode, 
+                 all_of(prob_cols), estimator = "macro")$.estimate
+  
+  # Compute Multi-Class PR AUC
+  pr_auc <- pr_auc(data = model_prediction, truth = failure_mode, 
+                   all_of(prob_cols), estimator = "macro")$.estimate
+  
+  # Compute Accuracy
+  acc <- accuracy(data = model_prediction, truth = failure_mode, 
+                  estimate = .pred_class)$.estimate
+  
+  # Generate a Confusion Matrix
+  conf_matrix <- conf_mat(data = model_prediction, truth = failure_mode, 
+                          estimate = .pred_class)
+  
+  # Plot the Confusion Matrix
+  conf_plot <- conf_matrix %>%
+    autoplot(type = "heatmap") + ggtitle("Confusion Matrix")
+  
+  # Plot ROC curves for all classes
+  roc_curve <- roc_curve(data = model_prediction, truth = failure_mode, 
+                         all_of(prob_cols)) %>%
+    autoplot() + ggtitle("ROC Curves for All Classes")
+  
+  # Return results
+  return(list(
+    auc = auc,
+    pr_auc = pr_auc,
+    accuracy = acc,
+    confusion_matrix = conf_plot,
+    roc_curve = roc_curve
+  ))
+}
+
+## Evaluate models
+
+# MLP 
+model_eval(training_data = training_data_a,testing_data = testing_data_a,tuned_model_workflow = mlp_tuned)
+
+# BNN
+model_eval(training_data = training_data_a,testing_data = testing_data_a,tuned_model_workflow = bnn_tuned)
+
+# XGB
+model_eval(training_data = training_data_a,testing_data = testing_data_a,tuned_model_workflow = xgb_tuned)
+
+
+
+
+
+
+
+
+
+
+
+
 
 
